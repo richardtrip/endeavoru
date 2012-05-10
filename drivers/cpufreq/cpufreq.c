@@ -1724,7 +1724,8 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 	unsigned int qmin = min(pm_qos_request(PM_QOS_CPU_FREQ_MIN), data->max);
 	unsigned int qmax = max(pm_qos_request(PM_QOS_CPU_FREQ_MAX), data->min);
 
-	pr_debug("setting new policy for CPU %u: %u - %u (%u - %u) kHz\n",
+	cpufreq_debug_disable_ratelimit();
+	dprintk("setting new policy for CPU %u: %u - %u (%u - %u) kHz\n",
 		policy->cpu, pmin, pmax, qmin, qmax);
 
 	/* clamp the new policy to PM QoS limits */
@@ -1807,6 +1808,7 @@ error_out:
 	/* restore the limits that the policy requested */
 	policy->min = pmin;
 	policy->max = pmax;
+	cpufreq_debug_enable_ratelimit();
 	return ret;
 }
 
@@ -2021,7 +2023,7 @@ static int cpu_freq_notify(struct notifier_block *b,
 			   unsigned long l, void *v)
 {
 	int cpu;
-	pr_debug("PM QoS %s %lu\n",
+	dprintk("PM QoS %s %lu\n",
 		b == &min_freq_notifier ? "min" : "max", l);
 	for_each_online_cpu(cpu) {
 		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
