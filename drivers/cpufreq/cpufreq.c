@@ -719,51 +719,55 @@ static ssize_t show_bios_limit(struct cpufreq_policy *policy, char *buf)
 
 static ssize_t show_frequency_voltage_table(struct cpufreq_policy *policy, char *buf)
 {
-  char *table = buf;
-  int i;
-  for (i = 0; i < FREQCOUNT; i++)
-    table += sprintf(table, "%d %d %d\n", cpufrequency[i], cpuvoltage[i], (cpuvoltage[i]-cpuuvoffset[i])); // TODO: Should be frequency, default voltage, current voltage 
-  return table - buf;
+	char *table = buf;
+	int i, start = 0, step = 1;
+
+	for (i = 0; i < FREQCOUNT; i++)
+		table += sprintf(table, "%d %d %d\n", cpufrequency[start+(i*step)], cpuvoltage[start+(i*step)], (cpuvoltage[start+(i*step)]-cpuuvoffset[start+(i*step)]));
+	return table - buf;
 }
 
 static ssize_t show_UV_mV_table(struct cpufreq_policy *policy, char *buf)
 {
-  char *table = buf;
-  int i;
-  table += sprintf(table, "%d", cpuuvoffset[0]);
-  for (i = 1; i < FREQCOUNT - 1; i++)
-  {
-    table += sprintf(table, " %d", cpuuvoffset[i]);
-  }
-  table += sprintf(table, " %d\n", cpuuvoffset[FREQCOUNT - 1]);
-  return table - buf;
-}
+	char *table = buf;
+	int i, start = 0, end = FREQCOUNT - 1, step = 1;
 
-static ssize_t store_UV_mV_table(struct cpufreq_policy *policy, char *buf, size_t count)
-{
-  int tmptable[FREQCOUNT];
-  int i;
-  unsigned int ret = sscanf(buf, "%d %d %d %d %d %d %d %d %d %d %d %d %d", &tmptable[0], &tmptable[1], &tmptable[2], &tmptable[3], &tmptable[4], &tmptable[5], &tmptable[6], &tmptable[7], &tmptable[8], &tmptable[9], &tmptable[10], &tmptable[11], &tmptable[12]);
-  if (ret != FREQCOUNT)
-    return -EINVAL;
-  for (i = 0; i < FREQCOUNT; i++)
-  {
-    if ((cpuvoltage[i]-tmptable[i]) > CPUMVMAX || (cpuvoltage[i]-tmptable[i]) < CPUMVMIN) // Keep within constraints
-      return -EINVAL;
-    else
-      cpuuvoffset[i] = tmptable[i];
-  }
-  return count;
+	table += sprintf(table, "%d", cpuuvoffset[start]);
+	for (i = 1; i < FREQCOUNT - 1; i++)
+	{
+		table += sprintf(table, " %d", cpuuvoffset[start+(i*step)]);
+	}
+	table += sprintf(table, " %d\n", cpuuvoffset[end]);
+
+	return table - buf;
 }
 
 static ssize_t show_cpuinfo_max_mV(struct cpufreq_policy *policy, char *buf)
 {
-  sprintf(buf, "%u\n", CPUMVMAX);
+	return sprintf(buf, "%u\n", CPUMVMAX);
 }
 
 static ssize_t show_cpuinfo_min_mV(struct cpufreq_policy *policy, char *buf)
 {
-  sprintf(buf, "%u\n", CPUMVMIN);
+	return sprintf(buf, "%u\n", CPUMVMIN);
+}
+
+static ssize_t store_UV_mV_table(struct cpufreq_policy *policy, char *buf, size_t count)
+{
+	int tmptable[FREQCOUNT];
+	int i, start = 0, step = 1;
+
+	unsigned int ret = sscanf(buf, "%d %d %d %d %d %d %d %d %d %d %d %d %d", &tmptable[0], &tmptable[1], &tmptable[2], &tmptable[3], &tmptable[4], &tmptable[5], &tmptable[6], &tmptable[7], &tmptable[8], &tmptable[9], &tmptable[10], &tmptable[11], &tmptable[12]);
+	if (ret != FREQCOUNT)
+		return -EINVAL;
+	for (i = 0; i < FREQCOUNT; i++)
+	{
+		if ((cpuvoltage[start+(i*step)]-tmptable[i]) > CPUMVMAX || (cpuvoltage[start+(i*step)]-tmptable[i]) < CPUMVMIN) // Keep within constraints
+			return -EINVAL;
+		else
+			cpuuvoffset[start+(i*step)] = tmptable[i];
+	}
+	return count;
 }
 
 cpufreq_freq_attr_ro_perm(cpuinfo_cur_freq, 0400);
