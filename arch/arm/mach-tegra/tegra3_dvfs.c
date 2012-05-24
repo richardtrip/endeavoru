@@ -45,7 +45,7 @@ static const int core_millivolts[MAX_DVFS_FREQS] = {
 #define VDD_CPU_BELOW_VDD_CORE		300
 static int cpu_below_core = VDD_CPU_BELOW_VDD_CORE;
 
-#define VDD_SAFE_STEP			50
+#define VDD_SAFE_STEP			100
 
 static struct dvfs_rail tegra3_dvfs_rail_vdd_cpu = {
 	.reg_id = "vdd_cpu",
