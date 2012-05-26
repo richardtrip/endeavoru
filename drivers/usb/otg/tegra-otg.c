@@ -169,12 +169,6 @@ void tegra_start_host(struct tegra_otg_data *tegra)
 	if (!tegra->pdev) {
 		tegra->pdev = tegra_usb_otg_host_register(pdata->ehci_device,
 							  pdata->ehci_pdata);
-
-#if defined(CONFIG_CABLE_DETECT_ACCESSORY)
-		if (board_mfg_mode() == 2 /* recovery mode */) {
-			cable_detection_queue_recovery_host_work(HZ);
-		}
-#endif
 	}
 }
 
@@ -204,36 +198,22 @@ static void irq_work(struct work_struct *work)
 
 	status = tegra->int_status;
 
-	if (tegra->rcv_host_en && board_mfg_mode() == 2 /* recovery mode */) {
-		if (from != OTG_STATE_A_HOST) {
-			if (tegra->int_status & USB_VBUS_INT_STATUS) {
-				if (status & USB_VBUS_STATUS)
-					to = OTG_STATE_A_HOST;
-				else
-					to = OTG_STATE_A_SUSPEND;
-			}
-		}
-	}
-	else {  /* NV Original */
-#if defined(CONFIG_USB_HOST_MODE)
-		if (tegra->int_status & USB_ID_INT_STATUS) {
-			if (status & USB_ID_STATUS) {
-				if ((status & USB_VBUS_STATUS) && (from != OTG_STATE_A_HOST))
-					to = OTG_STATE_B_PERIPHERAL;
-				else
-					to = OTG_STATE_A_SUSPEND;
-			}
+	if (tegra->int_status & USB_ID_INT_STATUS) {
+		if (status & USB_ID_STATUS) {
+			if ((status & USB_VBUS_STATUS) && (from != OTG_STATE_A_HOST))
+				to = OTG_STATE_B_PERIPHERAL;
 			else
-				to = OTG_STATE_A_HOST;
+				to = OTG_STATE_A_SUSPEND;
 		}
-#endif
-		if (from != OTG_STATE_A_HOST) {
-			if (tegra->int_status & USB_VBUS_INT_STATUS) {
-				if (status & USB_VBUS_STATUS)
-					to = OTG_STATE_B_PERIPHERAL;
-				else
-					to = OTG_STATE_A_SUSPEND;
-			}
+		else
+			to = OTG_STATE_A_HOST;
+	}
+	if (from != OTG_STATE_A_HOST) {
+		if (tegra->int_status & USB_VBUS_INT_STATUS) {
+			if (status & USB_VBUS_STATUS)
+				to = OTG_STATE_B_PERIPHERAL;
+			else
+				to = OTG_STATE_A_SUSPEND;
 		}
 	}
 	spin_unlock_irqrestore(&tegra->lock, flags);
