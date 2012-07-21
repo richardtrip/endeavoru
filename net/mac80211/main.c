@@ -33,12 +33,6 @@
 #include "cfg.h"
 #include "debugfs.h"
 
-
-static bool ieee80211_disable_40mhz_24ghz;
-module_param(ieee80211_disable_40mhz_24ghz, bool, 0644);
-MODULE_PARM_DESC(ieee80211_disable_40mhz_24ghz,
-		 "Disable 40MHz support in the 2.4GHz band");
-
 static struct lock_class_key ieee80211_rx_skb_queue_class;
 
 void ieee80211_configure_filter(struct ieee80211_local *local)
@@ -331,6 +325,8 @@ u32 ieee80211_reset_erp_info(struct ieee80211_sub_if_data *sdata)
 static void ieee80211_tasklet_handler(unsigned long data)
 {
 	struct ieee80211_local *local = (struct ieee80211_local *) data;
+	struct sta_info *sta, *tmp;
+	struct skb_eosp_msg_data *eosp_data;
 	struct sk_buff *skb;
 
 	while ((skb = skb_dequeue(&local->skb_queue)) ||
@@ -345,6 +341,18 @@ static void ieee80211_tasklet_handler(unsigned long data)
 		case IEEE80211_TX_STATUS_MSG:
 			skb->pkt_type = 0;
 			ieee80211_tx_status(local_to_hw(local), skb);
+			break;
+		case IEEE80211_EOSP_MSG:
+			eosp_data = (void *)skb->cb;
+			for_each_sta_info(local, eosp_data->sta, sta, tmp) {
+				/* skip wrong virtual interface */
+				if (memcmp(eosp_data->iface,
+					   sta->sdata->vif.addr, ETH_ALEN))
+					continue;
+				clear_sta_flag(sta, WLAN_STA_SP);
+				break;
+			}
+			dev_kfree_skb(skb);
 			break;
 		default:
 			WARN(1, "mac80211: Packet is of unknown type %d\n",
@@ -364,7 +372,8 @@ static void ieee80211_restart_work(struct work_struct *work)
 	flush_workqueue(local->workqueue);
 
 	mutex_lock(&local->mtx);
-	WARN(test_bit(SCAN_HW_SCANNING, &local->scanning),
+	WARN(test_bit(SCAN_HW_SCANNING, &local->scanning) ||
+	     local->sched_scanning,
 		"%s called with hardware scan in progress\n", __func__);
 	mutex_unlock(&local->mtx);
 
@@ -545,7 +554,9 @@ ieee80211_default_mgmt_stypes[NUM_NL80211_IFTYPES] = {
 	},
 	[NL80211_IFTYPE_MESH_POINT] = {
 		.tx = 0xffff,
-		.rx = BIT(IEEE80211_STYPE_ACTION >> 4),
+		.rx = BIT(IEEE80211_STYPE_ACTION >> 4) |
+			BIT(IEEE80211_STYPE_AUTH >> 4) |
+			BIT(IEEE80211_STYPE_DEAUTH >> 4),
 	},
 };
 
@@ -584,8 +595,7 @@ struct ieee80211_hw *ieee80211_alloc_hw(size_t priv_data_len,
 
 	wiphy->flags |= WIPHY_FLAG_NETNS_OK |
 			WIPHY_FLAG_4ADDR_AP |
-			WIPHY_FLAG_4ADDR_STATION |
-			WIPHY_FLAG_SUPPORTS_SEPARATE_DEFAULT_KEYS;
+			WIPHY_FLAG_4ADDR_STATION;
 
 	if (!ops->set_key)
 		wiphy->flags |= WIPHY_FLAG_IBSS_RSN;
@@ -612,6 +622,7 @@ struct ieee80211_hw *ieee80211_alloc_hw(size_t priv_data_len,
 	local->hw.max_rates = 1;
 	local->hw.max_report_rates = 0;
 	local->hw.max_rx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF;
+	local->hw.max_tx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF;
 	local->hw.conf.long_frame_max_tx_count = wiphy->retry_long;
 	local->hw.conf.short_frame_max_tx_count = wiphy->retry_short;
 	local->user_power_level = -1;
@@ -656,6 +667,9 @@ struct ieee80211_hw *ieee80211_alloc_hw(size_t priv_data_len,
 	setup_timer(&local->dynamic_ps_timer,
 		    ieee80211_dynamic_ps_timer, (unsigned long) local);
 
+	INIT_WORK(&local->sched_scan_stopped_work,
+		  ieee80211_sched_scan_stopped_work);
+
 	sta_info_init(local);
 
 	for (i = 0; i < IEEE80211_MAX_QUEUES; i++) {
@@ -686,7 +700,7 @@ EXPORT_SYMBOL(ieee80211_alloc_hw);
 int ieee80211_register_hw(struct ieee80211_hw *hw)
 {
 	struct ieee80211_local *local = hw_to_local(hw);
-	int result;
+	int result, i;
 	enum ieee80211_band band;
 	int channels, max_bitrates;
 	bool supp_ht;
@@ -700,6 +714,13 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 		/* keep last -- depends on hw flags! */
 		WLAN_CIPHER_SUITE_AES_CMAC
 	};
+
+	if ((hw->wiphy->wowlan.flags || hw->wiphy->wowlan.n_patterns)
+#ifdef CONFIG_PM
+	    && (!local->ops->suspend || !local->ops->resume)
+#endif
+	    )
+		return -EINVAL;
 
 	if (hw->max_report_rates == 0)
 		hw->max_report_rates = hw->max_rates;
@@ -726,18 +747,6 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 		}
 		channels += sband->n_channels;
 
-		/*
-		 * Since ieee80211_disable_40mhz_24ghz is global, we can
-		 * modify the sband's ht data even if the driver uses a
-		 * global structure for that.
-		 */
-		if (ieee80211_disable_40mhz_24ghz &&
-		    band == IEEE80211_BAND_2GHZ &&
-		    sband->ht_cap.ht_supported) {
-			sband->ht_cap.cap &= ~IEEE80211_HT_CAP_SUP_WIDTH_20_40;
-			sband->ht_cap.cap &= ~IEEE80211_HT_CAP_SGI_40;
-		}
-
 		if (max_bitrates < sband->n_bitrates)
 			max_bitrates = sband->n_bitrates;
 		supp_ht = supp_ht || sband->ht_cap.ht_supported;
@@ -749,16 +758,43 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 		return -ENOMEM;
 
 	/* if low-level driver supports AP, we also support VLAN */
-	if (local->hw.wiphy->interface_modes & BIT(NL80211_IFTYPE_AP))
-		local->hw.wiphy->interface_modes |= BIT(NL80211_IFTYPE_AP_VLAN);
+	if (local->hw.wiphy->interface_modes & BIT(NL80211_IFTYPE_AP)) {
+		hw->wiphy->interface_modes |= BIT(NL80211_IFTYPE_AP_VLAN);
+		hw->wiphy->software_iftypes |= BIT(NL80211_IFTYPE_AP_VLAN);
+	}
 
 	/* mac80211 always supports monitor */
-	local->hw.wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
+	hw->wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
+	hw->wiphy->software_iftypes |= BIT(NL80211_IFTYPE_MONITOR);
+
+	/*
+	 * mac80211 doesn't support more than 1 channel, and also not more
+	 * than one IBSS interface
+	 */
+	for (i = 0; i < hw->wiphy->n_iface_combinations; i++) {
+		const struct ieee80211_iface_combination *c;
+		int j;
+
+		c = &hw->wiphy->iface_combinations[i];
+
+		if (c->num_different_channels > 1)
+			return -EINVAL;
+
+		for (j = 0; j < c->n_limits; j++)
+			if ((c->limits[j].types & BIT(NL80211_IFTYPE_ADHOC)) &&
+			    c->limits[j].max > 1)
+				return -EINVAL;
+	}
 
 #ifndef CONFIG_MAC80211_MESH
 	/* mesh depends on Kconfig, but drivers should set it if they want */
 	local->hw.wiphy->interface_modes &= ~BIT(NL80211_IFTYPE_MESH_POINT);
 #endif
+
+	/* if the underlying driver supports mesh, mac80211 will (at least)
+	 * provide routing of mesh authentication frames to userspace */
+	if (local->hw.wiphy->interface_modes & BIT(NL80211_IFTYPE_MESH_POINT))
+		local->hw.wiphy->flags |= WIPHY_FLAG_MESH_AUTH;
 
 	/* mac80211 supports control port protocol changing */
 	local->hw.wiphy->flags |= WIPHY_FLAG_CONTROL_PORT_PROTOCOL;
@@ -838,6 +874,18 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 	if (!local->ops->remain_on_channel)
 		local->hw.wiphy->max_remain_on_channel_duration = 5000;
 
+	if (local->ops->sched_scan_start)
+		local->hw.wiphy->flags |= WIPHY_FLAG_SUPPORTS_SCHED_SCAN;
+
+	/* mac80211 based drivers don't support internal TDLS setup */
+	if (local->hw.wiphy->flags & WIPHY_FLAG_SUPPORTS_TDLS)
+		local->hw.wiphy->flags |= WIPHY_FLAG_TDLS_EXTERNAL_SETUP;
+
+	if (local->hw.flags & IEEE80211_HW_SUPPORTS_CANCEL_SCAN)
+		local->hw.wiphy->flags |= WIPHY_FLAG_SUPPORTS_CANCEL_SCAN;
+	if (local->hw.flags & IEEE80211_HW_SUPPORTS_IM_SCAN_EVENT)
+		local->hw.wiphy->flags |= WIPHY_FLAG_SUPPORTS_IM_SCAN_EVENT;
+
 	result = wiphy_register(local->hw.wiphy);
 	if (result < 0)
 		goto fail_wiphy_register;
@@ -861,10 +909,8 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 	 * and we need some headroom for passing the frame to monitor
 	 * interfaces, but never both at the same time.
 	 */
-	BUILD_BUG_ON(IEEE80211_TX_STATUS_HEADROOM !=
-			sizeof(struct ieee80211_tx_status_rtap_hdr));
 	local->tx_headroom = max_t(unsigned int , local->hw.extra_tx_headroom,
-				   sizeof(struct ieee80211_tx_status_rtap_hdr));
+				   IEEE80211_TX_STATUS_HEADROOM);
 
 	debugfs_hw_add(local);
 
@@ -878,10 +924,6 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 	local->hw.conf.listen_interval = local->hw.max_listen_interval;
 
 	local->dynamic_ps_forced_timeout = -1;
-
-	result = sta_info_start(local);
-	if (result < 0)
-		goto fail_sta_info;
 
 	result = ieee80211_wep_init(local);
 	if (result < 0)
@@ -945,7 +987,6 @@ int ieee80211_register_hw(struct ieee80211_hw *hw)
 	rtnl_unlock();
 	ieee80211_wep_free(local);
 	sta_info_stop(local);
- fail_sta_info:
 	destroy_workqueue(local->workqueue);
  fail_workqueue:
 	wiphy_unregister(local->hw.wiphy);
@@ -991,7 +1032,6 @@ void ieee80211_unregister_hw(struct ieee80211_hw *hw)
 	cancel_work_sync(&local->reconfig_filter);
 
 	ieee80211_clear_tx_pending(local);
-	sta_info_stop(local);
 	rate_control_deinitialize(local);
 
 	if (skb_queue_len(&local->skb_queue) ||
@@ -1003,6 +1043,7 @@ void ieee80211_unregister_hw(struct ieee80211_hw *hw)
 
 	destroy_workqueue(local->workqueue);
 	wiphy_unregister(local->hw.wiphy);
+	sta_info_stop(local);
 	ieee80211_wep_free(local);
 	ieee80211_led_exit(local);
 	kfree(local->int_scan_req);
@@ -1069,6 +1110,8 @@ static void __exit ieee80211_exit(void)
 		ieee80211s_stop();
 
 	ieee80211_iface_exit();
+
+	rcu_barrier();
 }
 
 

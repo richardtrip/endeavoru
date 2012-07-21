@@ -6,6 +6,7 @@
 #include <linux/bitops.h>
 #include <linux/etherdevice.h>
 #include <linux/slab.h>
+#include <linux/crc32.h>
 #include <net/cfg80211.h>
 #include <net/ip.h>
 #include "core.h"
@@ -150,12 +151,19 @@ void ieee80211_set_bitrate_flags(struct wiphy *wiphy)
 			set_mandatory_flags_band(wiphy->bands[band], band);
 }
 
+bool cfg80211_supported_cipher_suite(struct wiphy *wiphy, u32 cipher)
+{
+	int i;
+	for (i = 0; i < wiphy->n_cipher_suites; i++)
+		if (cipher == wiphy->cipher_suites[i])
+			return true;
+	return false;
+}
+
 int cfg80211_validate_key_settings(struct cfg80211_registered_device *rdev,
 				   struct key_params *params, int key_idx,
 				   bool pairwise, const u8 *mac_addr)
 {
-	int i;
-
 	if (key_idx > 5)
 		return -EINVAL;
 
@@ -225,10 +233,7 @@ int cfg80211_validate_key_settings(struct cfg80211_registered_device *rdev,
 		}
 	}
 
-	for (i = 0; i < rdev->wiphy.n_cipher_suites; i++)
-		if (params->cipher == rdev->wiphy.cipher_suites[i])
-			break;
-	if (i == rdev->wiphy.n_cipher_suites)
+	if (!cfg80211_supported_cipher_suite(&rdev->wiphy, params->cipher))
 		return -EINVAL;
 
 	return 0;
@@ -391,8 +396,9 @@ int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
 		}
 		break;
 	case cpu_to_le16(0):
-		if (iftype != NL80211_IFTYPE_ADHOC)
-			return -1;
+		if (iftype != NL80211_IFTYPE_ADHOC &&
+		    iftype != NL80211_IFTYPE_STATION)
+				return -1;
 		break;
 	}
 
@@ -512,10 +518,9 @@ int ieee80211_data_from_8023(struct sk_buff *skb, const u8 *addr,
 		if (head_need)
 			skb_orphan(skb);
 
-		if (pskb_expand_head(skb, head_need, 0, GFP_ATOMIC)) {
-			pr_err("failed to reallocate Tx buffer\n");
+		if (pskb_expand_head(skb, head_need, 0, GFP_ATOMIC))
 			return -ENOMEM;
-		}
+
 		skb->truesize += head_need;
 	}
 
@@ -544,7 +549,8 @@ EXPORT_SYMBOL(ieee80211_data_from_8023);
 
 void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
 			      const u8 *addr, enum nl80211_iftype iftype,
-			      const unsigned int extra_headroom)
+			      const unsigned int extra_headroom,
+			      bool has_80211_header)
 {
 	struct sk_buff *frame = NULL;
 	u16 ethertype;
@@ -553,14 +559,18 @@ void ieee80211_amsdu_to_8023s(struct sk_buff *skb, struct sk_buff_head *list,
 	int remaining, err;
 	u8 dst[ETH_ALEN], src[ETH_ALEN];
 
-	err = ieee80211_data_to_8023(skb, addr, iftype);
-	if (err)
-		goto out;
+	if (has_80211_header) {
+		err = ieee80211_data_to_8023(skb, addr, iftype);
+		if (err)
+			goto out;
 
-	/* skip the wrapping header */
-	eth = (struct ethhdr *) skb_pull(skb, sizeof(struct ethhdr));
-	if (!eth)
-		goto out;
+		/* skip the wrapping header */
+		eth = (struct ethhdr *) skb_pull(skb, sizeof(struct ethhdr));
+		if (!eth)
+			goto out;
+	} else {
+		eth = (struct ethhdr *) skb->data;
+	}
 
 	while (skb != frame) {
 		u8 padding;
@@ -741,7 +751,7 @@ static void cfg80211_process_wdev_events(struct wireless_dev *wdev)
 				NULL);
 			break;
 		case EVENT_ROAMED:
-			__cfg80211_roamed(wdev, ev->rm.bssid,
+			__cfg80211_roamed(wdev, ev->rm.channel, ev->rm.bssid,
 					  ev->rm.req_ie, ev->rm.req_ie_len,
 					  ev->rm.resp_ie, ev->rm.resp_ie_len);
 			break;
@@ -752,6 +762,9 @@ static void cfg80211_process_wdev_events(struct wireless_dev *wdev)
 			break;
 		case EVENT_IBSS_JOINED:
 			__cfg80211_ibss_joined(wdev->netdev, ev->ij.bssid);
+			break;
+		case EVENT_IM_SCAN_RESULT:
+			__cfg80211_send_intermediate_result(wdev->netdev, ev);
 			break;
 		}
 		wdev_unlock(wdev);
@@ -803,6 +816,11 @@ int cfg80211_change_iface(struct cfg80211_registered_device *rdev,
 		return -EBUSY;
 
 	if (ntype != otype) {
+		err = cfg80211_can_change_interface(rdev, dev->ieee80211_ptr,
+						    ntype);
+		if (err)
+			return err;
+
 		dev->ieee80211_ptr->use_4addr = false;
 		dev->ieee80211_ptr->mesh_id_up_len = 0;
 
@@ -896,3 +914,308 @@ u16 cfg80211_calculate_bitrate(struct rate_info *rate)
 	/* do NOT round down here */
 	return (bitrate + 50000) / 100000;
 }
+
+int cfg80211_validate_beacon_int(struct cfg80211_registered_device *rdev,
+				 u32 beacon_int)
+{
+	struct wireless_dev *wdev;
+	int res = 0;
+
+	if (!beacon_int)
+		return -EINVAL;
+
+	mutex_lock(&rdev->devlist_mtx);
+
+	list_for_each_entry(wdev, &rdev->netdev_list, list) {
+		if (!wdev->beacon_interval)
+			continue;
+		if (wdev->beacon_interval != beacon_int) {
+			res = -EINVAL;
+			break;
+		}
+	}
+
+	mutex_unlock(&rdev->devlist_mtx);
+
+	return res;
+}
+
+int cfg80211_can_change_interface(struct cfg80211_registered_device *rdev,
+				  struct wireless_dev *wdev,
+				  enum nl80211_iftype iftype)
+{
+	struct wireless_dev *wdev_iter;
+	int num[NUM_NL80211_IFTYPES];
+	int total = 1;
+	int i, j;
+
+	ASSERT_RTNL();
+
+	/* Always allow software iftypes */
+	if (rdev->wiphy.software_iftypes & BIT(iftype))
+		return 0;
+
+	/*
+	 * Drivers will gradually all set this flag, until all
+	 * have it we only enforce for those that set it.
+	 */
+	if (!(rdev->wiphy.flags & WIPHY_FLAG_ENFORCE_COMBINATIONS))
+		return 0;
+
+	memset(num, 0, sizeof(num));
+
+	num[iftype] = 1;
+
+	mutex_lock(&rdev->devlist_mtx);
+	list_for_each_entry(wdev_iter, &rdev->netdev_list, list) {
+		if (wdev_iter == wdev)
+			continue;
+		if (!netif_running(wdev_iter->netdev))
+			continue;
+
+		if (rdev->wiphy.software_iftypes & BIT(wdev_iter->iftype))
+			continue;
+
+		num[wdev_iter->iftype]++;
+		total++;
+	}
+	mutex_unlock(&rdev->devlist_mtx);
+
+	for (i = 0; i < rdev->wiphy.n_iface_combinations; i++) {
+		const struct ieee80211_iface_combination *c;
+		struct ieee80211_iface_limit *limits;
+
+		c = &rdev->wiphy.iface_combinations[i];
+
+		limits = kmemdup(c->limits, sizeof(limits[0]) * c->n_limits,
+				 GFP_KERNEL);
+		if (!limits)
+			return -ENOMEM;
+		if (total > c->max_interfaces)
+			goto cont;
+
+		for (iftype = 0; iftype < NUM_NL80211_IFTYPES; iftype++) {
+			if (rdev->wiphy.software_iftypes & BIT(iftype))
+				continue;
+			for (j = 0; j < c->n_limits; j++) {
+				if (!(limits[j].types & iftype))
+					continue;
+				if (limits[j].max < num[iftype])
+					goto cont;
+				limits[j].max -= num[iftype];
+			}
+		}
+		/* yay, it fits */
+		kfree(limits);
+		return 0;
+ cont:
+		kfree(limits);
+	}
+
+	return -EBUSY;
+}
+
+int ieee80211_get_ratemask(struct ieee80211_supported_band *sband,
+			   const u8 *rates, unsigned int n_rates,
+			   u32 *mask)
+{
+	int i, j;
+
+	if (!sband)
+		return -EINVAL;
+
+	if (n_rates == 0 || n_rates > NL80211_MAX_SUPP_RATES)
+		return -EINVAL;
+
+	*mask = 0;
+
+	for (i = 0; i < n_rates; i++) {
+		int rate = (rates[i] & 0x7f) * 5;
+		bool found = false;
+
+		for (j = 0; j < sband->n_bitrates; j++) {
+			if (sband->bitrates[j].bitrate == rate) {
+				found = true;
+				*mask |= BIT(j);
+				break;
+			}
+		}
+		if (!found)
+			return -EINVAL;
+	}
+
+	/*
+	 * mask must have at least one bit set here since we
+	 * didn't accept a 0-length rates array nor allowed
+	 * entries in the array that didn't exist
+	 */
+
+	return 0;
+}
+
+u32 ieee802_11_parse_elems_crc(u8 *start, size_t len,
+			       struct ieee802_11_elems *elems,
+			       u64 filter, u32 crc)
+{
+	size_t left = len;
+	u8 *pos = start;
+	bool calc_crc = filter != 0;
+
+	memset(elems, 0, sizeof(*elems));
+	elems->ie_start = start;
+	elems->total_len = len;
+
+	while (left >= 2) {
+		u8 id, elen;
+
+		id = *pos++;
+		elen = *pos++;
+		left -= 2;
+
+		if (elen > left)
+			break;
+
+		if (calc_crc && id < 64 && (filter & (1ULL << id)))
+			crc = crc32_be(crc, pos - 2, elen + 2);
+
+		switch (id) {
+		case WLAN_EID_SSID:
+			elems->ssid = pos;
+			elems->ssid_len = elen;
+			break;
+		case WLAN_EID_SUPP_RATES:
+			elems->supp_rates = pos;
+			elems->supp_rates_len = elen;
+			break;
+		case WLAN_EID_FH_PARAMS:
+			elems->fh_params = pos;
+			elems->fh_params_len = elen;
+			break;
+		case WLAN_EID_DS_PARAMS:
+			elems->ds_params = pos;
+			elems->ds_params_len = elen;
+			break;
+		case WLAN_EID_CF_PARAMS:
+			elems->cf_params = pos;
+			elems->cf_params_len = elen;
+			break;
+		case WLAN_EID_TIM:
+			if (elen >= sizeof(struct ieee80211_tim_ie)) {
+				elems->tim = (void *)pos;
+				elems->tim_len = elen;
+			}
+			break;
+		case WLAN_EID_IBSS_PARAMS:
+			elems->ibss_params = pos;
+			elems->ibss_params_len = elen;
+			break;
+		case WLAN_EID_CHALLENGE:
+			elems->challenge = pos;
+			elems->challenge_len = elen;
+			break;
+		case WLAN_EID_VENDOR_SPECIFIC:
+			if (elen >= 4 && pos[0] == 0x00 && pos[1] == 0x50 &&
+			    pos[2] == 0xf2) {
+				/* Microsoft OUI (00:50:F2) */
+
+				if (calc_crc)
+					crc = crc32_be(crc, pos - 2, elen + 2);
+
+				if (pos[3] == 1) {
+					/* OUI Type 1 - WPA IE */
+					elems->wpa = pos;
+					elems->wpa_len = elen;
+				} else if (elen >= 5 && pos[3] == 2) {
+					/* OUI Type 2 - WMM IE */
+					if (pos[4] == 0) {
+						elems->wmm_info = pos;
+						elems->wmm_info_len = elen;
+					} else if (pos[4] == 1) {
+						elems->wmm_param = pos;
+						elems->wmm_param_len = elen;
+					}
+				}
+			}
+			break;
+		case WLAN_EID_RSN:
+			elems->rsn = pos;
+			elems->rsn_len = elen;
+			break;
+		case WLAN_EID_ERP_INFO:
+			elems->erp_info = pos;
+			elems->erp_info_len = elen;
+			break;
+		case WLAN_EID_EXT_SUPP_RATES:
+			elems->ext_supp_rates = pos;
+			elems->ext_supp_rates_len = elen;
+			break;
+		case WLAN_EID_HT_CAPABILITY:
+			if (elen >= sizeof(struct ieee80211_ht_cap))
+				elems->ht_cap_elem = (void *)pos;
+			break;
+		case WLAN_EID_HT_INFORMATION:
+			if (elen >= sizeof(struct ieee80211_ht_info))
+				elems->ht_info_elem = (void *)pos;
+			break;
+		case WLAN_EID_MESH_ID:
+			elems->mesh_id = pos;
+			elems->mesh_id_len = elen;
+			break;
+		case WLAN_EID_MESH_CONFIG:
+			if (elen >= sizeof(struct ieee80211_meshconf_ie))
+				elems->mesh_config = (void *)pos;
+			break;
+		case WLAN_EID_PEER_MGMT:
+			elems->peering = pos;
+			elems->peering_len = elen;
+			break;
+		case WLAN_EID_PREQ:
+			elems->preq = pos;
+			elems->preq_len = elen;
+			break;
+		case WLAN_EID_PREP:
+			elems->prep = pos;
+			elems->prep_len = elen;
+			break;
+		case WLAN_EID_PERR:
+			elems->perr = pos;
+			elems->perr_len = elen;
+			break;
+		case WLAN_EID_RANN:
+			if (elen >= sizeof(struct ieee80211_rann_ie))
+				elems->rann = (void *)pos;
+			break;
+		case WLAN_EID_CHANNEL_SWITCH:
+			elems->ch_switch_elem = pos;
+			elems->ch_switch_elem_len = elen;
+			break;
+		case WLAN_EID_QUIET:
+			if (!elems->quiet_elem) {
+				elems->quiet_elem = pos;
+				elems->quiet_elem_len = elen;
+			}
+			elems->num_of_quiet_elem++;
+			break;
+		case WLAN_EID_COUNTRY:
+			elems->country_elem = pos;
+			elems->country_elem_len = elen;
+			break;
+		case WLAN_EID_PWR_CONSTRAINT:
+			elems->pwr_constr_elem = pos;
+			elems->pwr_constr_elem_len = elen;
+			break;
+		case WLAN_EID_TIMEOUT_INTERVAL:
+			elems->timeout_int = pos;
+			elems->timeout_int_len = elen;
+			break;
+		default:
+			break;
+		}
+
+		left -= elen;
+		pos += elen;
+	}
+
+	return crc;
+}
+EXPORT_SYMBOL(ieee802_11_parse_elems_crc);

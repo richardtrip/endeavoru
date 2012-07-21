@@ -130,7 +130,7 @@ void ieee80211_ba_session_work(struct work_struct *work)
 	 * down by the code that set the flag, so this
 	 * need not run.
 	 */
-	if (test_sta_flags(sta, WLAN_STA_BLOCK_BA))
+	if (test_sta_flag(sta, WLAN_STA_BLOCK_BA))
 		return;
 
 	mutex_lock(&sta->ampdu_mlme.mtx);
@@ -140,14 +140,35 @@ void ieee80211_ba_session_work(struct work_struct *work)
 				sta, tid, WLAN_BACK_RECIPIENT,
 				WLAN_REASON_QSTA_TIMEOUT, true);
 
-		tid_tx = sta->ampdu_mlme.tid_tx[tid];
-		if (!tid_tx)
-			continue;
+		if (test_and_clear_bit(tid,
+				       sta->ampdu_mlme.tid_rx_stop_requested))
+			___ieee80211_stop_rx_ba_session(
+				sta, tid, WLAN_BACK_RECIPIENT,
+				WLAN_REASON_UNSPECIFIED, true);
 
-		if (test_bit(HT_AGG_STATE_WANT_START, &tid_tx->state))
+		tid_tx = sta->ampdu_mlme.tid_start_tx[tid];
+		if (tid_tx) {
+			/*
+			 * Assign it over to the normal tid_tx array
+			 * where it "goes live".
+			 */
+			spin_lock_bh(&sta->lock);
+
+			sta->ampdu_mlme.tid_start_tx[tid] = NULL;
+			/* could there be a race? */
+			if (sta->ampdu_mlme.tid_tx[tid])
+				kfree(tid_tx);
+			else
+				ieee80211_assign_tid_tx(sta, tid, tid_tx);
+			spin_unlock_bh(&sta->lock);
+
 			ieee80211_tx_ba_session_handle_start(sta, tid);
-		else if (test_and_clear_bit(HT_AGG_STATE_WANT_STOP,
-					    &tid_tx->state))
+			continue;
+		}
+
+		tid_tx = rcu_dereference_protected_tid_tx(sta, tid);
+		if (tid_tx && test_and_clear_bit(HT_AGG_STATE_WANT_STOP,
+						 &tid_tx->state))
 			___ieee80211_stop_tx_ba_session(sta, tid,
 							WLAN_BACK_INITIATOR,
 							true);
@@ -165,12 +186,8 @@ void ieee80211_send_delba(struct ieee80211_sub_if_data *sdata,
 	u16 params;
 
 	skb = dev_alloc_skb(sizeof(*mgmt) + local->hw.extra_tx_headroom);
-
-	if (!skb) {
-		printk(KERN_ERR "%s: failed to allocate buffer "
-					"for delba frame\n", sdata->name);
+	if (!skb)
 		return;
-	}
 
 	skb_reserve(skb, local->hw.extra_tx_headroom);
 	mgmt = (struct ieee80211_mgmt *) skb_put(skb, 24);

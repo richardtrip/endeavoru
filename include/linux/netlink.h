@@ -221,6 +221,7 @@ struct netlink_callback {
 					struct netlink_callback *cb);
 	int			(*done)(struct netlink_callback *cb);
 	int			family;
+	unsigned int		prev_seq, seq;
 	long			args[6];
 };
 

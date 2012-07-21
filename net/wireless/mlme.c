@@ -170,7 +170,9 @@ void __cfg80211_send_deauth(struct net_device *dev,
 			break;
 		}
 		if (wdev->authtry_bsses[i] &&
-		    memcmp(wdev->authtry_bsses[i]->pub.bssid, bssid, ETH_ALEN) == 0) {
+		    memcmp(wdev->authtry_bsses[i]->pub.bssid, bssid,
+			   ETH_ALEN) == 0 &&
+		    memcmp(mgmt->sa, dev->dev_addr, ETH_ALEN) == 0) {
 			cfg80211_unhold_bss(wdev->authtry_bsses[i]);
 			cfg80211_put_bss(&wdev->authtry_bsses[i]->pub);
 			wdev->authtry_bsses[i] = NULL;
@@ -770,6 +772,15 @@ void cfg80211_new_sta(struct net_device *dev, const u8 *mac_addr,
 }
 EXPORT_SYMBOL(cfg80211_new_sta);
 
+void cfg80211_del_sta(struct net_device *dev, const u8 *mac_addr, gfp_t gfp)
+{
+	struct wiphy *wiphy = dev->ieee80211_ptr->wiphy;
+	struct cfg80211_registered_device *rdev = wiphy_to_dev(wiphy);
+
+	nl80211_send_sta_del_event(rdev, dev, mac_addr, gfp);
+}
+EXPORT_SYMBOL(cfg80211_del_sta);
+
 struct cfg80211_mgmt_registration {
 	struct list_head list;
 
@@ -889,7 +900,8 @@ int cfg80211_mlme_mgmt_tx(struct cfg80211_registered_device *rdev,
 			  struct ieee80211_channel *chan, bool offchan,
 			  enum nl80211_channel_type channel_type,
 			  bool channel_type_valid, unsigned int wait,
-			  const u8 *buf, size_t len, u64 *cookie)
+			  const u8 *buf, size_t len, bool no_cck,
+			  u64 *cookie)
 {
 	struct wireless_dev *wdev = dev->ieee80211_ptr;
 	const struct ieee80211_mgmt *mgmt;
@@ -954,6 +966,16 @@ int cfg80211_mlme_mgmt_tx(struct cfg80211_registered_device *rdev,
 			if (memcmp(mgmt->bssid, dev->dev_addr, ETH_ALEN))
 				err = -EINVAL;
 			break;
+		case NL80211_IFTYPE_MESH_POINT:
+			if (memcmp(mgmt->sa, mgmt->bssid, ETH_ALEN)) {
+				err = -EINVAL;
+				break;
+			}
+			/*
+			 * check for mesh DA must be done by driver as
+			 * cfg80211 doesn't track the stations
+			 */
+			break;
 		default:
 			err = -EOPNOTSUPP;
 			break;
@@ -970,7 +992,7 @@ int cfg80211_mlme_mgmt_tx(struct cfg80211_registered_device *rdev,
 	/* Transmit the Action frame as requested by user space */
 	return rdev->ops->mgmt_tx(&rdev->wiphy, dev, chan, offchan,
 				  channel_type, channel_type_valid,
-				  wait, buf, len, cookie);
+				  wait, buf, len, no_cck, cookie);
 }
 
 bool cfg80211_rx_mgmt(struct net_device *dev, int freq, const u8 *buf,
@@ -1063,3 +1085,25 @@ void cfg80211_cqm_pktloss_notify(struct net_device *dev,
 	nl80211_send_cqm_pktloss_notify(rdev, dev, peer, num_packets, gfp);
 }
 EXPORT_SYMBOL(cfg80211_cqm_pktloss_notify);
+
+void cfg80211_gtk_rekey_notify(struct net_device *dev, const u8 *bssid,
+			       const u8 *replay_ctr, gfp_t gfp)
+{
+	struct wireless_dev *wdev = dev->ieee80211_ptr;
+	struct wiphy *wiphy = wdev->wiphy;
+	struct cfg80211_registered_device *rdev = wiphy_to_dev(wiphy);
+
+	nl80211_gtk_rekey_notify(rdev, dev, bssid, replay_ctr, gfp);
+}
+EXPORT_SYMBOL(cfg80211_gtk_rekey_notify);
+
+void cfg80211_pmksa_candidate_notify(struct net_device *dev, int index,
+				     const u8 *bssid, bool preauth, gfp_t gfp)
+{
+	struct wireless_dev *wdev = dev->ieee80211_ptr;
+	struct wiphy *wiphy = wdev->wiphy;
+	struct cfg80211_registered_device *rdev = wiphy_to_dev(wiphy);
+
+	nl80211_pmksa_candidate_notify(rdev, dev, index, bssid, preauth, gfp);
+}
+EXPORT_SYMBOL(cfg80211_pmksa_candidate_notify);
