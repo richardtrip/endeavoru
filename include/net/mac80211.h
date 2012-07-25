@@ -21,6 +21,9 @@
 #include <net/cfg80211.h>
 #include <asm/unaligned.h>
 
+
+#define IFF_TX_SKB_SHARING	0x10000	/* The interface supports sharing
+					 * skbs on transmit */
 /**
  * DOC: Introduction
  *
